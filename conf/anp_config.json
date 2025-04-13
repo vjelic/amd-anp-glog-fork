@@ -1,0 +1,10 @@
+{
+  "debug_enabled": true,
+  "log_level": "ERROR",
+  "output_dir": "/tmp",
+  "max_buckets": 5,
+  "bucket_interval_ns": 30000,
+  "metrics": []
+}
+
+
