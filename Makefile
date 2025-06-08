@@ -17,10 +17,10 @@ SRCS = $(filter-out $(EXCLUDE_FILE), $(wildcard $(addsuffix /*.cc, $(SRC_DIRS)))
 OBJS = $(patsubst %.cc, build/%.o, $(SRCS))
 DEPS = $(patsubst %.cc, build/%.d, $(SRCS))
 
-ifeq ($(ANP_DEBUG), 1)
-  CFLAGS+= -DANP_DEBUG_ENABLED
+ifeq ($(ANP_TELEMETRY_ENABLED), 1)
+  CFLAGS+= -DANP_TELEMETRY_ENABLED
 else
-  CFLAGS+= -UANP_DEBUG_ENABLED
+  CFLAGS+= -UANP_TELEMETRY_ENABLED
 endif
 
 # Check if RCCL_BUILD is provided

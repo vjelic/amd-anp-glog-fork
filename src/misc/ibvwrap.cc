@@ -238,3 +238,7 @@ ncclResult_t wrap_ibv_event_type_str(char **ret, enum ibv_event_type event) {
 int wrap_ibv_pd_set_udma_mask(struct ibv_pd *ibpd, uint8_t udma_mask) {
   return ionic_dv_pd_set_udma_mask(ibpd, udma_mask);
 }
+
+int wrap_ionic_dv_qp_set_gda(struct ibv_qp *ibqp, bool enable_send, bool enable_recv) {
+  return ionic_dv_qp_set_gda(ibqp, enable_send, enable_recv);
+}

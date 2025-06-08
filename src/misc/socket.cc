@@ -734,7 +734,7 @@ ncclResult_t ncclSocketInit(struct ncclSocket* sock, union ncclSocketAddress* ad
   if ((sock->asyncFlag || sock->abortFlag) && sock->fd >= 0) {
     int flags;
     EQCHECKGOTO(flags = fcntl(sock->fd, F_GETFL), -1, ret, fail);
-    SYSCHECKGOTO(fcntl(sock->fd, F_SETFL, flags | O_NONBLOCK), ret, fail);
+    SYSCHECKGOTO(fcntl(sock->fd, F_SETFL, flags | O_NONBLOCK), "fcntl", ret, fail);
   }
 
 exit:

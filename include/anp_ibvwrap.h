@@ -22,5 +22,6 @@
 #include "ibvwrap.h"
 
 int wrap_ibv_pd_set_udma_mask(struct ibv_pd *ibpd, uint8_t udma_mask);
+int wrap_ionic_dv_qp_set_gda(struct ibv_qp *ibqp, bool enable_send, bool enable_recv);
 
 #endif //End include guard

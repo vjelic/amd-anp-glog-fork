@@ -22,6 +22,10 @@ std::chrono::steady_clock::time_point ncclEpoch;
 
 static __thread int tid = -1;
 
+void ncclDebugForceReinit() {
+  __atomic_store_n(&ncclDebugLevel, -1, __ATOMIC_RELEASE);
+}
+
 void ncclDebugInit() {
   pthread_mutex_lock(&ncclDebugLock);
   if (ncclDebugLevel != -1) { pthread_mutex_unlock(&ncclDebugLock); return; }

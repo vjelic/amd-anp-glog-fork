@@ -18,15 +18,6 @@ ncclResult_t getHostName(char* hostname, int maxlen, const char delim) {
   return ncclSuccess;
 }
 
-uint64_t getHash(const char* string, int n) {
-  // Based on DJB2a, result = result * 33 ^ char
-  uint64_t result = 5381;
-  for (int c = 0; c < n; c++) {
-    result = ((result << 5) + result) ^ string[c];
-  }
-  return result;
-}
-
 int parseStringList(const char* string, struct netIf* ifList, int maxList) {
   if (!string) return 0;
 

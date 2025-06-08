@@ -7,12 +7,12 @@
 #include <boost/version.hpp>
 #include "anp_metrics.h"
 
-#ifdef ANP_DEBUG_ENABLED
+#ifdef ANP_TELEMETRY_ENABLED
     #define TELEMETRY_STATUS "enabled"
-    #define ANP_DEBUG_EXECUTE(stmt) do { if (anp_state::anp_debug_enable) { stmt; } } while (0)
+    #define ANP_TELEMETRY_EXECUTE(stmt) do { stmt; } while (0)
 #else
     #define TELEMETRY_STATUS "disabled"
-    #define ANP_DEBUG_EXECUTE(stmt)
+    #define ANP_TELEMETRY_EXECUTE(stmt)
 #endif
 
 #define IS_POWER_OF_2(number) \
@@ -30,6 +30,12 @@ struct qp_stats_s {
     counter_t num_wqe_completed;
     counter_t num_wqe_errors;
     counter_t num_slot_miss;
+    counter_t num_cts_sent;
+    counter_t num_cts_sent_unsignalled;
+    counter_t num_cts_sent_signalled;
+    counter_t num_recv_wqe;
+    counter_t num_write_wqe;
+    counter_t num_write_imm_wqe;
     uint64_t  wqe_completion_time_min;
     uint64_t  wqe_completion_time_max;
 };
@@ -208,6 +214,13 @@ public:
                         qp_stats_node.put("num_wqe_rcvd", queue_state[qp_id]->stats.num_wqe_rcvd);
                         qp_stats_node.put("num_wqe_completed", queue_state[qp_id]->stats.num_wqe_completed);
                         qp_stats_node.put("num_slot_miss", queue_state[qp_id]->stats.num_slot_miss);
+                        qp_stats_node.put("num_cts_sent", queue_state[qp_id]->stats.num_cts_sent);
+                        qp_stats_node.put("num_cts_sent_unsignalled",
+                                          queue_state[qp_id]->stats.num_cts_sent_unsignalled);
+                        qp_stats_node.put("num_cts_sent_signalled", queue_state[qp_id]->stats.num_cts_sent_signalled);
+                        qp_stats_node.put("num_recv_wqe", queue_state[qp_id]->stats.num_recv_wqe);
+                        qp_stats_node.put("num_write_wqe", queue_state[qp_id]->stats.num_write_wqe);
+                        qp_stats_node.put("num_wirte_imm_wqe", queue_state[qp_id]->stats.num_write_imm_wqe);
                         qp_stats_node.put("wqe_completion_ns_min", queue_state[qp_id]->stats.wqe_completion_time_min);
                         qp_stats_node.put("wqe_completion_ns_max", queue_state[qp_id]->stats.wqe_completion_time_max);
                         num_wqe_sent_per_channel += queue_state[qp_id]->stats.num_wqe_sent;
@@ -278,6 +291,19 @@ public:
         qp_info->wqe_id_tracker[wqe_id] = start_time;
     }
 
+
+    void update_recv_wqe_metrics(const int& qp_id,
+                                 const uint64_t& wqe_id,
+                                 const uint64_t& start_time) {
+        auto& qp_info = queue_state[qp_id];
+        if (!qp_info) {
+            ANP_LOG_ERROR("invalid qp_id %d", qp_id);
+            return;
+        }
+        qp_info->stats.num_wqe_sent++;
+        qp_info->wqe_id_tracker[wqe_id] = start_time;
+    }
+
     void update_wqe_rcvd_metrics(const int& qp_id,
                                  const uint64_t& wqe_id,
                                  const uint64_t& end_time) {
@@ -318,7 +344,62 @@ public:
             //ANP_LOG_ERROR("invalid qp_id %d", qp_id);
             return;
         }
+        qp_info->stats.num_cts_sent++;
         qp_info->stats.num_wqe_sent++;
+    }
+
+    void increment_num_cts_sent(const int& qp_id) {
+        auto& qp_info = queue_state[qp_id];
+        if (!qp_info) {
+            //ANP_LOG_ERROR("invalid qp_id %d", qp_id);
+            return;
+        }
+        qp_info->stats.num_cts_sent++;
+    }
+
+    void increment_num_cts_sent_unsignalled(const int& qp_id) {
+        auto& qp_info = queue_state[qp_id];
+        if (!qp_info) {
+            //ANP_LOG_ERROR("invalid qp_id %d", qp_id);
+            return;
+        }
+        qp_info->stats.num_cts_sent_unsignalled++;
+    }
+
+    void increment_num_cts_sent_signalled(const int& qp_id) {
+        auto& qp_info = queue_state[qp_id];
+        if (!qp_info) {
+            //ANP_LOG_ERROR("invalid qp_id %d", qp_id);
+            return;
+        }
+        qp_info->stats.num_cts_sent_signalled++;
+    }
+
+    void increment_num_recv_wqe(const int& qp_id) {
+        auto& qp_info = queue_state[qp_id];
+        if (!qp_info) {
+            //ANP_LOG_ERROR("invalid qp_id %d", qp_id);
+            return;
+        }
+        qp_info->stats.num_recv_wqe++;
+    }
+
+    void increment_num_write_wqe(const int& qp_id, uint32_t count) {
+        auto& qp_info = queue_state[qp_id];
+        if (!qp_info) {
+            //ANP_LOG_ERROR("invalid qp_id %d", qp_id);
+            return;
+        }
+        qp_info->stats.num_write_wqe += count;
+    }
+
+    void increment_num_write_imm_wqe(const int& qp_id) {
+        auto& qp_info = queue_state[qp_id];
+        if (!qp_info) {
+            //ANP_LOG_ERROR("invalid qp_id %d", qp_id);
+            return;
+        }
+        qp_info->stats.num_write_imm_wqe++;
     }
 
     void update_wqe_size_metrics(const uint32_t& wqe_length) {
@@ -390,16 +471,14 @@ public:
     }
 
     void load_config() {
-        // check the debug_en environment variable; if set to "1", enable debugging
-        const char* debug_env = std::getenv("AMD_ANP_DEBUG_EN");
 
-        if (debug_env != NULL && std::string(debug_env) == "1") {
-            anp_debug_enable = true;
-        } else {
-            anp_debug_enable = false;
-        }
+        // set defaults
+        anp_config_file_path = "";
+        anp_logger::log_level = LOG_ERROR;
+        output_dir = "/tmp";
+        bucket_sz_log2 = (uint32_t) log2(1024);
+        max_buckets = 5;
 
-        // check the debug_en environment variable; if set to "1", enable debugging
         const char* config_file_env = std::getenv("AMD_ANP_CONFIG_FILE");
 
         if (config_file_env != NULL) {
@@ -413,9 +492,6 @@ public:
                 boost::property_tree::ptree pt;
                 boost::property_tree::read_json(file, pt);
 
-                // if the json has debug enabled, use it (default false if not found)
-                bool json_flag = pt.get("debug_enabled", false);
-                anp_debug_enable = anp_debug_enable || json_flag;
                 std::string level = pt.get<std::string>("log_level", "ERROR"); // Default is ERROR
                 if (level == "NONE")
                     anp_logger::log_level = LOG_NONE;
@@ -444,7 +520,8 @@ public:
             } catch (const std::exception& e) {
                 ANP_LOG_ERROR("error parsing JSON: %s", e.what());
             }
-        }
+	}
+
         ANP_LOG_VERBOSE("Process ID: %d, Thread ID: %lu", getpid(), pthread_self());
         ANP_LOG_VERBOSE("Boost version: %d", BOOST_VERSION);
     }
@@ -466,31 +543,35 @@ public:
     }
 
     void write_json_to_file() {
+        std::string filename;
+        std::string tmp_path;
+        std::ostringstream oss;
+        boost::property_tree::ptree root;
+
+        filename = output_dir + "/device_status_" + std::to_string(device_id) + ".json";
+	// construct a unique temporary file path
+        oss << filename << ".tmp." << getpid() << "." << std::this_thread::get_id();
+        tmp_path = oss.str();
+
         if (output_dir.empty()) {
             ANP_LOG_ERROR("json output directory not specified");
             return;
         }
-        std::string filename = output_dir + "/device_status_" + std::to_string(device_id) + ".json";
-        std::string tmp_filename = filename + ".tmp";
-        std::ofstream ofs(tmp_filename);
-        boost::property_tree::ptree root;
-
         to_json(root);
-        if (ofs.is_open()) {
-            boost::property_tree::write_json(ofs, root);
-            ofs.flush();
-            ofs.close();
-            if (!file_exists(tmp_filename)) {
-                ANP_LOG_ERROR("temporary file %s does not exist", tmp_filename.c_str());
-                return;
-            }
-            if (rename(tmp_filename.c_str(), filename.c_str()) != 0) {
-                ANP_LOG_ERROR("failed to rename file %s to %s, err %d, %s",
-                              tmp_filename.c_str(), filename.c_str(),
-                              errno, strerror(errno));
-            }
-        } else {
-            ANP_LOG_ERROR("failed to open file %s", filename.c_str());
+
+	std::ofstream ofs(tmp_path);
+        if (!ofs.is_open()) {
+            ANP_LOG_ERROR("failed to open temp file %s, err %d, %s",
+                          tmp_path.c_str(), errno, strerror(errno));
+	    return;
+        }
+        boost::property_tree::write_json(ofs, root);
+        ofs.flush();
+        ofs.close();
+        if (std::rename(tmp_path.c_str(), filename.c_str()) != 0) {
+            ANP_LOG_ERROR("failed to rename file %s to %s, err %d, %s",
+                          tmp_path.c_str(), filename.c_str(),
+                          errno, strerror(errno));
         }
     }
 
@@ -500,9 +581,9 @@ public:
     }
 
     ~anp_state() {
-        if (!anp_debug_enable) {
-            return;
-        }
+#ifndef ANP_TELEMETRY_ENABLED
+        return;
+#endif
         shutdown();
     }
 
@@ -521,8 +602,6 @@ private:
     queue_pair_map_t       queue_state;
     histogram_config_s     histogram_config;
 
-public:
-    static bool            anp_debug_enable;
 };
 
 #endif

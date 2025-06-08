@@ -1,4 +1,3 @@
-
 //
 // Copyright(C) Advanced Micro Devices, Inc. All rights reserved.
 //
@@ -30,6 +29,7 @@
 #include <unistd.h>
 #include <sys/time.h>
 #include <x86intrin.h>
+#include <dlfcn.h>
 #include "net.h"
 #include "timer.h"
 #include "anp_ibvwrap.h"
@@ -43,6 +43,15 @@ extern "C" {
 
 extern void *anp_rccl_bootstrap_handler(void *arg);
 
+#define NCCL_NET_OPTIONAL_RECV_COMPLETION    (void *)0x1
+#define NCCL_NET_USE_WRITE_OP                (void *)0x1
+#define ANP_CTS_QP_SLOT_INVALID              0xFF
+
+//#define ANP_DEBUG_TRACE_EN
+#define CTS_RCVR_OFFLOAD_ENABLED
+#define CTS_INLINE_ENABLED
+
+#define MAX_INLINE_DATA_SIZE 24
 #define ENABLE_TIMER 0
 #define NCCL_NET_PLUGIN_SYMBOL ncclNetPlugin_v8
 
@@ -50,14 +59,28 @@ extern void *anp_rccl_bootstrap_handler(void *arg);
 static char ncclIbIfName[MAX_IF_NAME_SIZE+1];
 static union ncclSocketAddress ncclIbIfAddr;
 
-#ifdef ANP_DEBUG_ENABLED
+#ifdef ANP_TELEMETRY_ENABLED
 static anp_state g_anp_state;
 #endif
-bool   anp_state::anp_debug_enable = false;
 anp_log_level_e anp_logger::log_level = LOG_ERROR;
 std::atomic<int> active_threads(0);
 
+static char libPathInfo[2048];
 thread_local int ncclDebugNoWarn = 1;
+
+struct {
+  uint64_t num_cts_sent;
+
+  uint64_t num_signalled_cts_sent;
+  uint64_t num_wr_wqe;
+  uint64_t num_wi_wqe;
+  uint64_t num_send_completion;
+  uint64_t num_send_completion_ok;
+
+  uint64_t num_recv_wqe;
+  uint64_t num_recv_completion;
+  uint64_t num_recv_completion_ok;
+} g_debug_stats;
 
 struct ncclIbMr {
   uintptr_t addr;
@@ -124,6 +147,56 @@ NCCL_PARAM(IbFifoTc, "IB_FIFO_TC", 0);
 pthread_t ncclIbAsyncThread;
 struct allocationTracker allocTracker[MAX_ALLOC_TRACK_NGPU] = {};
 
+static void
+anp_stats_dump_on_signal (void)
+{
+  fprintf(stderr, "=======\n");
+  for (int i = 0; i < ncclNMergedIbDevs; i++) {
+    fprintf(stderr, "Ibdev %s\n", ncclIbMergedDevs[i].devName);
+  }
+  fprintf(stderr, "%-52s : %lu\n", "num_cts_sent", g_debug_stats.num_cts_sent);
+  fprintf(stderr, "%-52s : %lu\n", "num_signalled_cts_sent", g_debug_stats.num_signalled_cts_sent);
+  fprintf(stderr, "%-52s : %lu\n", "num_recv_wqe", g_debug_stats.num_recv_wqe);
+  if (g_debug_stats.num_recv_completion ==
+          (g_debug_stats.num_signalled_cts_sent + g_debug_stats.num_recv_wqe)) {
+      fprintf(stderr, "%-52s : %lu/%lu (OK)\n", "num_recv_completion/expected",
+              g_debug_stats.num_recv_completion,
+              (g_debug_stats.num_signalled_cts_sent + g_debug_stats.num_recv_wqe));
+  } else {
+      fprintf(stderr, "%-52s : %lu/%lu (ERR)\n", "num_recv_completion/expected",
+              g_debug_stats.num_recv_completion,
+              (g_debug_stats.num_signalled_cts_sent + g_debug_stats.num_recv_wqe));
+  }
+  fprintf(stderr, "%-52s : %lu\n", "num_recv_completion_ok", g_debug_stats.num_recv_completion_ok);
+  if ((g_debug_stats.num_recv_completion - g_debug_stats.num_recv_completion_ok) > 0) {
+      fprintf(stderr, "%-52s : %lu\n", "num_recv_completion_err (ERR)",
+              g_debug_stats.num_recv_completion - g_debug_stats.num_recv_completion_ok);
+  }
+
+  fprintf(stderr, "%-52s : %lu\n", "num_wr_wqe", g_debug_stats.num_wr_wqe);
+  fprintf(stderr, "%-52s : %lu\n", "num_wi_wqe", g_debug_stats.num_wi_wqe);
+  if (g_debug_stats.num_send_completion ==
+          (g_debug_stats.num_wr_wqe + g_debug_stats.num_wi_wqe)) {
+      fprintf(stderr, "%-52s : %lu/%lu (OK)\n", "num_send_completion/expected",
+              g_debug_stats.num_send_completion,
+              (g_debug_stats.num_wr_wqe + g_debug_stats.num_wi_wqe));
+  } else {
+      fprintf(stderr, "%-52s : %lu/%lu (ERR)\n", "num_send_completion/expected",
+              g_debug_stats.num_send_completion,
+              (g_debug_stats.num_wr_wqe + g_debug_stats.num_wi_wqe));
+  }
+  if ((g_debug_stats.num_send_completion - g_debug_stats.num_send_completion_ok) > 0) {
+      fprintf(stderr, "%-52s : %lu\n", "num_send_completion_err (ERR)",
+              g_debug_stats.num_send_completion - g_debug_stats.num_send_completion_ok);
+  }
+  fprintf(stderr, "=======\n");
+}
+
+void anp_reinit_debug_log (void) {
+  setenv("NCCL_DEBUG", "INFO", true);
+  setenv("NCCL_DEBUG_SUBSYS", "ALL", true);
+}
+
 void* json_thread_init(void* arg) {
     ANP_LOG_VERBOSE("Process ID: %d, Thread ID: %lu", getpid(), pthread_self());
     anp_state* snapshot = static_cast<anp_state*>(arg);
@@ -135,9 +208,8 @@ void* json_thread_init(void* arg) {
     return nullptr;
 }
 
-void anp_create_json_thread()
-{
-#ifdef ANP_DEBUG_ENABLED
+void anp_create_json_thread(void) {
+#ifdef ANP_TELEMETRY_ENABLED
     pthread_t thread_id;
     pthread_attr_t attr;
     struct sched_param param;
@@ -166,39 +238,38 @@ void anp_create_json_thread()
 #endif
 }
 
-void anp_sig_handler(int signum)
-{
+void anp_sig_handler(int signum) {
   ANP_LOG_VERBOSE("Process ID: %d, Thread ID: %lu, signal: %s (%u)",
                   getpid(), pthread_self(), strsignal(signum), signum);
 
   if (signum == SIGUSR1) {
     anp_create_json_thread();
     return;
+  } else if (signum == SIGUSR2) {
+    anp_reinit_debug_log();
   }
   exit (-1);
 }
 
-void anp_register_signal_hdl()
-{
-    std::vector<int> signalsToCatch = {SIGUSR1};
-    for (auto signum : signalsToCatch)
-    {
+void anp_register_signal_hdl(void) {
+    std::vector<int> signalsToCatch = {SIGUSR1, SIGUSR2};
+
+    for (auto signum : signalsToCatch) {
       if (signal(signum, anp_sig_handler) == SIG_ERR)
         WARN("NET/IB : unable to register signal handler for %s (%u)\n", strsignal(signum), signum);
     }
 }
 
-void anp_deregister_signal_hdl()
-{
-    std::vector<int> signalsToCatch = {SIGUSR1};
-    for (auto signum : signalsToCatch)
-    {
+void anp_deregister_signal_hdl(void) {
+    std::vector<int> signalsToCatch = {SIGUSR1, SIGUSR2};
+
+    for (auto signum : signalsToCatch) {
       if (signal(signum, SIG_IGN) == SIG_ERR)
         WARN("NET/IB : unable to deregister signal handler for %s (%u)\n", strsignal(signum), signum);
     }
 }
 
-void wait_for_threads_before_exit() {
+void wait_for_threads_before_exit(void) {
     // Restore default signal handling
     anp_deregister_signal_hdl();
 
@@ -224,8 +295,9 @@ static void* ncclIbAsyncThreadMain(void* args) {
   return NULL;
 }
 
-static inline uint64_t gettime_ns() {
+static inline uint64_t gettime_ns(void) {
   struct timespec ts;
+
   clock_gettime(CLOCK_MONOTONIC, &ts);
   return uint64_t(ts.tv_sec)*1000*1000*1000 + ts.tv_nsec;
 }
@@ -645,6 +717,18 @@ void do_bootstrap() {
    WARN("continue regular processing for rank [%d]", global_rank);
 }
 
+static void showVersion() {
+  // retrieve librccl path
+  Dl_info pathInfo;
+
+  if (dladdr((void*)ncclIbAsyncThreadMain, &pathInfo)) {
+    strncpy(libPathInfo, pathInfo.dli_fname, sizeof(libPathInfo)-1);
+  } else {
+    // sets libPath to Unknown if the above function call is not successful
+    strncpy(libPathInfo, "Unknown", sizeof(libPathInfo)-1);
+  }
+}
+
 // Plugin implementations of the required functions
 ncclResult_t anpNetInit(ncclDebugLogger_t logFunction) {
   ncclResult_t ret;
@@ -652,14 +736,17 @@ ncclResult_t anpNetInit(ncclDebugLogger_t logFunction) {
   static int shownIbHcaEnv = 0;
   if(wrap_ibv_symbols() != ncclSuccess) { return ncclInternalError; }
 
-  WARN("ANP plugin loaded successfully with telemetry " TELEMETRY_STATUS);
+  static pthread_once_t once = PTHREAD_ONCE_INIT;
+  pthread_once(&once, showVersion);
+
+  WARN("ANP plugin loaded successfully with telemetry %s : %s", TELEMETRY_STATUS, libPathInfo);
   // TODO
   //do_bootstrap();
   // register exit handler
-#ifdef ANP_DEBUG_ENABLED
+#ifdef ANP_TELEMETRY_ENABLED
   std::atexit(wait_for_threads_before_exit);
-  anp_register_signal_hdl();
 #endif
+  anp_register_signal_hdl();
 
   // Detect IB cards
   int nIbDevs = 0;
@@ -1006,20 +1093,25 @@ struct ncclIbListenComm {
   struct ncclIbCommStage stage;
 };
 
-struct alignas(64) ncclIbSendFifo {
+struct alignas(32) ncclIbSendFifo {
   uint64_t addr;
+  uint32_t rkeys[1];
   int      size;
-  uint32_t rkeys[NCCL_IB_MAX_DEVS_PER_NIC];
-  uint32_t nreqs;
-  uint32_t tag;
-  uint64_t idx;
-  char padding[24];
-};
+  uint8_t  nreqs;
+  uint16_t tag;
+  uint32_t idx;
+  char padding[9];
+} __attribute__((packed));
 
 struct ncclIbQp {
   struct ibv_qp* qp;
   int devIndex;
   int remDevIdx;
+  int8_t ctsQpSlot;
+#ifdef ANP_DEBUG_TRACE_EN
+  uint16_t channelId;
+  uint8_t data;
+#endif
 };
 
 struct ncclIbRemSizesFifo {
@@ -1140,6 +1232,11 @@ ncclResult_t ncclIbInitCommDevBase(int ibDevN, struct ncclIbNetCommDevBase* base
   // CQ is sized to accommodate the max SQ + RQ WQE completions. If each SQ WQE could be signaled, then,
   // for each QP, there can be 2*MAX_REQUESTS completions for SQ and MAX_REQUESTS completions for RQ.
   NCCLCHECK(wrap_ibv_create_cq(&base->cq, ibDev->context, 3*MAX_REQUESTS*ncclParamIbQpsPerConn(), NULL, NULL, 0));
+#ifdef ANP_DEBUG_TRACE_EN
+  INFO(NCCL_NET, "[ANP_TRACE] Created cq, ibDevN %d, handle %u, fd %d, refcount %d, cqe %d", ibDevN, base->cq->handle,
+       base->cq->channel ? base->cq->channel->fd : -1,
+       base->cq->channel ? base->cq->channel->refcnt : -1, base->cq->cqe);
+#endif
 
   return ncclSuccess;
 }
@@ -1170,7 +1267,7 @@ static bool last_ud[128];
 
 ncclResult_t ncclIbCreateQp(uint8_t ib_port, struct ncclIbNetCommDevBase* base,
                             int access_flags, struct ncclIbQp* qp, int channelId,
-                            bool dataQP = false) {
+                            bool dataQP, int8_t qp_idx) {
   struct ibv_qp_init_attr qpInitAttr;
   memset(&qpInitAttr, 0, sizeof(struct ibv_qp_init_attr));
   qpInitAttr.send_cq = base->cq;
@@ -1213,11 +1310,16 @@ ncclResult_t ncclIbCreateQp(uint8_t ib_port, struct ncclIbNetCommDevBase* base,
   qpInitAttr.cap.max_recv_wr = MAX_REQUESTS;
   qpInitAttr.cap.max_send_sge = 1;
   qpInitAttr.cap.max_recv_sge = 1;
+#if defined(CTS_INLINE_ENABLED)
+  qpInitAttr.cap.max_inline_data = MAX_INLINE_DATA_SIZE;
+#else
   qpInitAttr.cap.max_inline_data = ncclParamIbUseInline() ? sizeof(struct ncclIbSendFifo) : 0;
+#endif
   NCCLCHECK(wrap_ibv_create_qp(&qp->qp, base->pd, &qpInitAttr));
-  ANP_DEBUG_EXECUTE(
+  ANP_TELEMETRY_EXECUTE(
       g_anp_state.add_queue_pair(base->ibDevN, channelId, qp->qp->qp_num, dataQP);
   );
+  wrap_ionic_dv_qp_set_gda(qp->qp, false, true);
   struct ibv_qp_attr qpAttr;
   memset(&qpAttr, 0, sizeof(struct ibv_qp_attr));
   qpAttr.qp_state = IBV_QPS_INIT;
@@ -1225,9 +1327,21 @@ ncclResult_t ncclIbCreateQp(uint8_t ib_port, struct ncclIbNetCommDevBase* base,
   qpAttr.port_num = ib_port;
   qpAttr.qp_access_flags = access_flags;
   NCCLCHECK(wrap_ibv_modify_qp(qp->qp, &qpAttr, IBV_QP_STATE | IBV_QP_PKEY_INDEX | IBV_QP_PORT | IBV_QP_ACCESS_FLAGS));
-  ANP_DEBUG_EXECUTE(
+  ANP_TELEMETRY_EXECUTE(
       anp_create_json_thread();
   );
+  if (dataQP == false) {
+    qp->ctsQpSlot = qp_idx;
+  } else {
+    qp->ctsQpSlot = ANP_CTS_QP_SLOT_INVALID;
+  }
+#ifdef ANP_DEBUG_TRACE_EN
+  qp->channelId = channelId;
+  qp->data = (dataQP == true) ? 1 : 0;
+  INFO(NCCL_NET, "[ANP_TRACE] Created %s qp %d, ch %d, cq handle %d, src nic %d",
+       dataQP ? "data" : "CTS", qp->qp->qp_num, channelId, base->cq->handle, base->ibDevN);
+#endif
+
   return ncclSuccess;
 }
 
@@ -1345,7 +1459,7 @@ ib_connect_check:
   comm->base.nqps = ncclParamIbQpsPerConn() * comm->base.ndevs; // We must have at least 1 qp per-device
   comm->base.isSend = true;
 
-  ANP_DEBUG_EXECUTE(
+  ANP_TELEMETRY_EXECUTE(
     g_anp_state.set_device_name(dev, "", mergedDev->devName);
   );
   // Init PD, Ctx for each IB device
@@ -1365,10 +1479,14 @@ ib_connect_check:
   for (int q = 0; q < comm->base.nqps; q++) {
     ncclIbSendCommDev* commDev = comm->devs + devIndex;
     ncclIbDev* ibDev = ncclIbDevs + commDev->base.ibDevN;
-    NCCLCHECK(ncclIbCreateQp(ibDev->portNum, &commDev->base, IBV_ACCESS_REMOTE_WRITE, comm->base.qps+q, channelId, true));
+    NCCLCHECK(ncclIbCreateQp(ibDev->portNum, &commDev->base, IBV_ACCESS_REMOTE_WRITE, comm->base.qps+q, channelId, true, q));
     comm->base.qps[q].devIndex = devIndex;
     meta.qpInfo[q].qpn      = comm->base.qps[q].qp->qp_num;
     meta.qpInfo[q].devIndex = comm->base.qps[q].devIndex;
+#ifdef ANP_DEBUG_TRACE_EN
+    INFO(NCCL_NET, "[ANP_TRACE] Created CTS QP %d, ch %d, dev index %d",
+         comm->base.qps[q].qp->qp_num, channelId, comm->base.qps[q].devIndex);
+#endif
 
     // Query ece capabilities (enhanced connection establishment)
     NCCLCHECK(wrap_ibv_query_ece(comm->base.qps[q].qp, &meta.qpInfo[q].ece, &meta.qpInfo[q].ece_supported));
@@ -1491,6 +1609,13 @@ ib_connect:
 
     NCCLCHECK(ncclIbRtrQp(qp, &commDev->base.gidInfo, remQpInfo->qpn, remDevInfo, false));
     NCCLCHECK(ncclIbRtsQp(qp));
+#ifdef ANP_DEBUG_TRACE_EN
+    INFO(NCCL_NET, "[ANP_TRACE] sendcomm %p, ch %d, %s qp %d, local nic %d, peer nic %d",
+         comm, comm->base.qps[q].channelId, comm->base.qps[q].data ? "data" : "cts",
+         comm->base.qps[q].qp->qp_num,
+         comm->devs[comm->base.qps[q].devIndex].base.ibDevN,
+         comm->base.remDevs[comm->base.qps[q].remDevIdx].ibv_dev_index);
+#endif
   }
 
   if (link_layer == IBV_LINK_LAYER_ETHERNET ) { // RoCE
@@ -1615,7 +1740,7 @@ ib_recv:
     // Local ibDevN
     ibDevN = rComm->devs[devIndex].base.ibDevN;
     ibDev = ncclIbDevs + ibDevN;
-    NCCLCHECK(ncclIbCreateQp(ibDev->portNum, &rCommDev->base, IBV_ACCESS_REMOTE_WRITE, qp, channelId));
+    NCCLCHECK(ncclIbCreateQp(ibDev->portNum, &rCommDev->base, IBV_ACCESS_REMOTE_WRITE, qp, channelId, false, q));
     qp->devIndex = devIndex;
     devIndex = (devIndex + 1) % rComm->base.ndevs;
 
@@ -1632,6 +1757,11 @@ ib_recv:
     bool override_tc = (q == 0) ? true : false;
     NCCLCHECK(ncclIbRtrQp(qp->qp, &rCommDev->base.gidInfo, remMeta.qpInfo[q].qpn, remDevInfo, override_tc));
     NCCLCHECK(ncclIbRtsQp(qp->qp));
+#ifdef ANP_DEBUG_TRACE_EN
+    INFO(NCCL_NET, "[ANP_TRACE] recvcomm %p, ch %d, %s qp %d, local nic %d, peer nic %d",
+         rComm, qp->channelId, qp->data ? "data" : "cts", qp->qp->qp_num,
+         ibDevN, rComm->base.remDevs[qp->remDevIdx].ibv_dev_index);
+#endif
   }
 
   rComm->flushEnabled = ((ncclIbGdrSupport() == ncclSuccess || ncclIbDmaBufSupport(lComm->dev) == ncclSuccess)
@@ -1666,7 +1796,7 @@ ib_recv:
       rCommDev->gpuFlush.sge.addr = (uint64_t)&rComm->gpuFlushHostMem;
       rCommDev->gpuFlush.sge.length = 1;
       rCommDev->gpuFlush.sge.lkey = rCommDev->gpuFlush.hostMr->lkey;
-      NCCLCHECK(ncclIbCreateQp(ibDev->portNum, &rCommDev->base, IBV_ACCESS_LOCAL_WRITE | IBV_ACCESS_REMOTE_READ | IBV_ACCESS_REMOTE_WRITE, &rCommDev->gpuFlush.qp, channelId));
+      NCCLCHECK(ncclIbCreateQp(ibDev->portNum, &rCommDev->base, IBV_ACCESS_LOCAL_WRITE | IBV_ACCESS_REMOTE_READ | IBV_ACCESS_REMOTE_WRITE, &rCommDev->gpuFlush.qp, channelId, true, 0xFF));
       struct ncclIbDevInfo devInfo;
       devInfo.lid         = ibDev->portAttr.lid;
       devInfo.link_layer  = ibDev->portAttr.link_layer;
@@ -1878,10 +2008,16 @@ ncclResult_t anpNetDeregMr(void* comm, void* mhandle) {
 
 NCCL_PARAM(IbSplitDataOnQps, "IB_SPLIT_DATA_ON_QPS", 0);
 
-ncclResult_t ncclIbMultiSend(struct ncclIbSendComm* comm, int slot) {
+ncclResult_t ncclIbMultiSend(struct ncclIbSendComm* comm, int slot, bool use_write_op) {
+  uint32_t num_write = 0;
   struct ncclIbRequest** reqs = comm->fifoReqs[slot];
+#if !defined(CTS_RCVR_OFFLOAD_ENABLED)
   volatile struct ncclIbSendFifo* slots = comm->fifo[slot];
   int nreqs = slots[0].nreqs;
+#else
+  int nreqs = 1;
+#endif
+  assert(nreqs == 1);
   if (nreqs > NCCL_NET_IB_MAX_RECVS) return ncclInternalError;
 
   uint64_t wr_id = 0ULL;
@@ -1893,15 +2029,20 @@ ncclResult_t ncclIbMultiSend(struct ncclIbSendComm* comm, int slot) {
     sge->addr=(uintptr_t)reqs[r]->send.data;
     wr->opcode = IBV_WR_RDMA_WRITE;
     wr->send_flags = 0;
+#if !defined(CTS_RCVR_OFFLOAD_ENABLED)
     wr->wr.rdma.remote_addr = slots[r].addr;
+#else
+    wr->wr.rdma.remote_addr = 0xdeadbeef;
+#endif
     wr->next = wr + 1;
     wr_id += (reqs[r] - comm->base.reqs) << (r*8);
+    num_write++;
   }
 
   // Write size as immediate data. In the case of multi-send, only write
   // 0 or 1 as size to indicate whether there was data sent or received.
   uint32_t immData = 0;
-  if (nreqs == 1) {
+  if ((nreqs == 1) && (use_write_op == false)) {
     immData = reqs[0]->send.size;
   } else {
     int* sizes = comm->remSizesFifo.elems[slot];
@@ -1911,28 +2052,35 @@ ncclResult_t ncclIbMultiSend(struct ncclIbSendComm* comm, int slot) {
   }
 
   struct ibv_send_wr* lastWr = comm->wrs+nreqs-1;
-  if (nreqs > 1 || (comm->ar && reqs[0]->send.size > ncclParamIbArThreshold())) {
-    // When using ADAPTIVE_ROUTING, send the bulk of the data first as an
-    // RDMA_WRITE, then a 0-byte RDMA_WRITE_WITH_IMM to trigger a remote
-    // completion.
-    lastWr++;
-    memset(lastWr, 0, sizeof(struct ibv_send_wr));
-    if (nreqs > 1) {
-      // Write remote sizes Fifo
-      lastWr->wr.rdma.remote_addr = comm->remSizesFifo.addr + slot*NCCL_NET_IB_MAX_RECVS*sizeof(int);
-      lastWr->num_sge = 1;
-      lastWr->sg_list = &comm->remSizesFifo.sge;
-    }
+  if (use_write_op == false) {
+      if (nreqs > 1 || (comm->ar && reqs[0]->send.size > ncclParamIbArThreshold())) {
+        // When using ADAPTIVE_ROUTING, send the bulk of the data first as an
+        // RDMA_WRITE, then a 0-byte RDMA_WRITE_WITH_IMM to trigger a remote
+        // completion.
+        lastWr++;
+        memset(lastWr, 0, sizeof(struct ibv_send_wr));
+        if (nreqs > 1) {
+          // Write remote sizes Fifo
+          lastWr->wr.rdma.remote_addr = comm->remSizesFifo.addr + slot*NCCL_NET_IB_MAX_RECVS*sizeof(int);
+          lastWr->num_sge = 1;
+          lastWr->sg_list = &comm->remSizesFifo.sge;
+        }
+      } else {
+          num_write--;
+      }
+      lastWr->wr_id = wr_id;
+      lastWr->opcode = IBV_WR_RDMA_WRITE_WITH_IMM;
+      lastWr->imm_data = immData;
+  } else {
+      lastWr->wr_id = wr_id;
   }
-  lastWr->wr_id = wr_id;
-  lastWr->opcode = IBV_WR_RDMA_WRITE_WITH_IMM;
-  lastWr->imm_data = immData;
   lastWr->next = NULL;
   lastWr->send_flags = IBV_SEND_SIGNALED;
 
   // Multi-QP: make sure IB writes are multiples of 128B so that LL and LL128 protocols still work
   const int align = 128;
   int nqps = ncclParamIbSplitDataOnQps() ? comm->base.nqps : comm->base.ndevs;
+  assert(nqps == 1);
   for (int i = 0; i < nqps; i++) {
     int qpIndex = comm->base.qpIndex;
     ncclIbQp* qp = comm->base.qps + qpIndex;
@@ -1942,8 +2090,11 @@ ncclResult_t ncclIbMultiSend(struct ncclIbSendComm* comm, int slot) {
       //ncclIbAddEvent(reqs[r], devIndex, &comm->devs[devIndex].base);
 
       // Select proper rkey (needed even for 0-size send)
+#if !defined(CTS_RCVR_OFFLOAD_ENABLED)
       comm->wrs[r].wr.rdma.rkey = slots[r].rkeys[qp->remDevIdx];
-
+#else
+      comm->wrs[r].wr.rdma.rkey = 0xbade;
+#endif
       int chunkSize = DIVUP(DIVUP(reqs[r]->send.size, nqps), align) * align;
       int length = std::min(reqs[r]->send.size-reqs[r]->send.offset, chunkSize);
       if (length <= 0) {
@@ -1953,7 +2104,7 @@ ncclResult_t ncclIbMultiSend(struct ncclIbSendComm* comm, int slot) {
         // Select proper lkey
         comm->sges[r].lkey = reqs[r]->send.lkeys[devIndex];
         comm->sges[r].length = length;
-        ANP_DEBUG_EXECUTE(
+        ANP_TELEMETRY_EXECUTE(
             g_anp_state.update_wqe_size_metrics(length);
         );
         comm->wrs[r].sg_list = comm->sges+r;
@@ -1961,7 +2112,7 @@ ncclResult_t ncclIbMultiSend(struct ncclIbSendComm* comm, int slot) {
       }
     }
 
-    if (nreqs > 1) {
+    if ((use_write_op == false) && (nreqs > 1)) {
       // Also make sure lastWr writes remote sizes using the right lkey
       comm->remSizesFifo.sge.lkey = comm->remSizesFifo.mrs[devIndex]->lkey;
       lastWr->wr.rdma.rkey = comm->remSizesFifo.rkeys[devIndex];
@@ -1970,52 +2121,71 @@ ncclResult_t ncclIbMultiSend(struct ncclIbSendComm* comm, int slot) {
     struct ibv_send_wr* bad_wr;
     uint64_t start_time;
 
-    ANP_DEBUG_EXECUTE(
+    ANP_TELEMETRY_EXECUTE(
         start_time = gettime_ns();
     );
     NCCLCHECK(wrap_ibv_post_send(qp->qp, comm->wrs, &bad_wr));
-    ANP_DEBUG_EXECUTE(
+    ANP_TELEMETRY_EXECUTE(
+        if (use_write_op) {
+          g_debug_stats.num_wr_wqe++;
+        } else {
+          g_debug_stats.num_wi_wqe++;
+        }
+        g_anp_state.increment_num_write_wqe(qp->qp->qp_num, num_write);
+        g_anp_state.increment_num_write_imm_wqe(qp->qp->qp_num);
         g_anp_state.update_wqe_send_metrics(qp->qp->qp_num, wr_id, start_time);
     );
-
     for (int r=0; r<nreqs; r++) {
       int chunkSize = DIVUP(DIVUP(reqs[r]->send.size, nqps), align) * align;
       reqs[r]->send.offset += chunkSize;
       comm->sges[r].addr += chunkSize;
       comm->wrs[r].wr.rdma.remote_addr += chunkSize;
 
+#ifdef ANP_DEBUG_TRACE_EN
+      INFO(NCCL_VERBS, "Posted send wr_id=%lu, wr_indx=%d, ch %d, qp_num=%d, src_nic=%d, dst_nic=%d, dlid=%d, opcode=%d, send_flags=%d, imm_data=%d, remote_addr=%lx, rkey=%x, length=%d, lkey=%x",
+          comm->wrs[r].wr_id, r, qp->channelId, qp->qp->qp_num, comm->devs[qp->devIndex].base.ibDevN , comm->base.remDevs[qp->remDevIdx].ibv_dev_index, comm->base.remDevs[qp->remDevIdx].lid,
+          comm->wrs[r].opcode, comm->wrs[r].send_flags, comm->wrs[r].imm_data, comm->wrs[r].wr.rdma.remote_addr,
+          comm->wrs[r].wr.rdma.rkey,comm->wrs[r].sg_list ? comm->wrs[r].sg_list->length : 0, comm->wrs[r].sg_list ? comm->wrs[r].sg_list->lkey : 0);
+#else
       TRACE(NCCL_VERBS, "Posted send wr_id=%lu, wr_indx=%d, qp_num=%d, src_nic=%d, dst_nic=%d, dlid=%d, opcode=%d, send_flags=%d, imm_data=%d, remote_addr=%lx, rkey=%x, length=%d, lkey=%x",
          comm->wrs[r].wr_id, r, qp->qp->qp_num, comm->devs[qp->devIndex].base.ibDevN , comm->base.remDevs[qp->remDevIdx].ibv_dev_index, comm->base.remDevs[qp->remDevIdx].lid,
          comm->wrs[r].opcode, comm->wrs[r].send_flags, comm->wrs[r].imm_data, comm->wrs[r].wr.rdma.remote_addr,
          comm->wrs[r].wr.rdma.rkey,comm->wrs[r].sg_list ? comm->wrs[r].sg_list->length : 0, comm->wrs[r].sg_list ? comm->wrs[r].sg_list->lkey : 0);
+#endif
     }
 
     // Select the next qpIndex
     comm->base.qpIndex = (comm->base.qpIndex+1) % comm->base.nqps;
   }
-
   return ncclSuccess;
 }
 
-//ncclResult_t anpNetIsend(void* sendComm, void* data, int size, int tag, void* mhandle, void** request) {
 ncclResult_t anpNetIsend(void* sendComm, void* data, int size, int tag, void* mhandle, void** request) {
   struct ncclIbSendComm* comm = (struct ncclIbSendComm*)sendComm;
   if (comm->base.ready == 0) { WARN("NET/IB: ncclIbIsend() called when comm->base.ready == 0"); return ncclInternalError; }
   if (comm->base.ready == 0) { *request = NULL; return ncclSuccess; }
 
+  bool use_write_op = (*request == NCCL_NET_USE_WRITE_OP) ? true : false;
   struct ncclIbMrHandle* mhandleWrapper = (struct ncclIbMrHandle*) mhandle;
 
+#ifdef ANP_DEBUG_TRACE_EN
+  INFO(NCCL_NET, "Processing send, sendComm %p, size %d, tag %d, use_write_op %d", sendComm, size, tag, use_write_op);
+#endif
   // Wait for the receiver to have posted the corresponding receive
+#if !defined(CTS_RCVR_OFFLOAD_ENABLED)
   int nreqs = 0;
   volatile struct ncclIbSendFifo* slots;
-
+#else
+  int nreqs = 1;
+#endif
   int slot = (comm->fifoHead) % MAX_REQUESTS;
   struct ncclIbRequest** reqs = comm->fifoReqs[slot];
+#if !defined(CTS_RCVR_OFFLOAD_ENABLED)
   slots = comm->fifo[slot];
   uint64_t idx = comm->fifoHead+1;
   if (slots[0].idx != idx) {
       *request = NULL;
-      ANP_DEBUG_EXECUTE(
+      ANP_TELEMETRY_EXECUTE(
           g_anp_state.update_slot_miss_metrics(comm->base.qpIndex);
       );
       return ncclSuccess;
@@ -2024,7 +2194,9 @@ ncclResult_t anpNetIsend(void* sendComm, void* data, int size, int tag, void* mh
   // Wait until all data has arrived
   for (int r=1; r<nreqs; r++) while(slots[r].idx != idx);
   __sync_synchronize(); // order the nreqsPtr load against tag/rkey/addr loads below
+#endif
   for (int r=0; r<nreqs; r++) {
+#if !defined(CTS_RCVR_OFFLOAD_ENABLED)
     if (reqs[r] != NULL || slots[r].tag != tag) continue;
 
     if (size > slots[r].size) size = slots[r].size;
@@ -2037,6 +2209,9 @@ ncclResult_t anpNetIsend(void* sendComm, void* data, int size, int tag, void* mh
         r, nreqs, tag, ncclSocketToString(&addr, line), slots[r].size, slots[r].addr, slots[r].rkeys[0]);
       return ncclInternalError;
     }
+#else
+    if (reqs[r] != NULL) continue;
+#endif
 
     struct ncclIbRequest* req;
     NCCLCHECK(ncclIbGetRequest(&comm->base, &req));
@@ -2076,10 +2251,12 @@ ncclResult_t anpNetIsend(void* sendComm, void* data, int size, int tag, void* mh
     }
 
     TIME_START(0);
-    NCCLCHECK(ncclIbMultiSend(comm, slot));
+    NCCLCHECK(ncclIbMultiSend(comm, slot, use_write_op));
 
     // Clear slots[0]->nreqs, as well as other fields to help debugging and sanity checks
+#if !defined(CTS_RCVR_OFFLOAD_ENABLED)
     memset((void*)slots, 0, sizeof(struct ncclIbSendFifo));
+#endif
     memset(reqs, 0, NCCL_NET_IB_MAX_RECVS*sizeof(struct ncclIbRequest*));
     comm->fifoHead++;
     TIME_STOP(0);
@@ -2091,6 +2268,7 @@ ncclResult_t anpNetIsend(void* sendComm, void* data, int size, int tag, void* mh
 }
 
 ncclResult_t ncclIbPostFifo(struct ncclIbRecvComm* comm, int n, void** data, int* sizes, int* tags, void** mhandles, struct ncclIbRequest* req) {
+  bool signalled = false;
   struct ibv_send_wr wr;
   memset(&wr, 0, sizeof(wr));
 
@@ -2101,8 +2279,10 @@ ncclResult_t ncclIbPostFifo(struct ncclIbRecvComm* comm, int n, void** data, int
 
   // Select the next devIndex (local) and QP to use for posting this CTS message
   // Since QPs are initialized by striping across devIndex, we can simply assign this to the same value
-  ncclIbQp* ctsQp = comm->base.qps + comm->base.devIndex;
-  comm->base.devIndex = (comm->base.devIndex + 1) % comm->base.ndevs;
+  //ncclIbQp* ctsQp = comm->base.qps + comm->base.devIndex;
+  //comm->base.devIndex = (comm->base.devIndex + 1) % comm->base.ndevs;
+  int qpIndex = comm->base.qpIndex;
+  ncclIbQp* ctsQp = comm->base.qps + qpIndex;
 
   for (int i=0; i<n; i++) {
     localElem[i].addr = (uint64_t)data[i];
@@ -2124,7 +2304,7 @@ ncclResult_t ncclIbPostFifo(struct ncclIbRecvComm* comm, int n, void** data, int
 
   // Set the correct sge properties
   comm->devs[ctsQp->devIndex].fifoSge.addr   = (uint64_t)localElem;
-  comm->devs[ctsQp->devIndex].fifoSge.length = n*sizeof(struct ncclIbSendFifo);
+  comm->devs[ctsQp->devIndex].fifoSge.length = MAX_INLINE_DATA_SIZE;
   wr.sg_list = &comm->devs[ctsQp->devIndex].fifoSge;
   wr.num_sge = 1;
 
@@ -2154,7 +2334,13 @@ ncclResult_t ncclIbPostFifo(struct ncclIbRecvComm* comm, int n, void** data, int
   //
   // slot == devIndex - When writing to fifo slot N, and this QP lives on device index N, it should send signalled.
   // This works out that each fifo posting QP gets drained
-  if (slot == ctsQp->devIndex) {
+  //if (slot == ctsQp->devIndex) {
+  if (slot == ctsQp->ctsQpSlot) {
+#ifdef ANP_DEBUG_TRACE_EN
+    INFO(NCCL_NET, "Need to send signalled CTS, slot %d, dev idx %d, qp %d",
+         slot, ctsQp->devIndex, ctsQp->qp->qp_num);
+#endif
+    signalled = true;
     wr.send_flags |= IBV_SEND_SIGNALED;
     wr.wr_id = req - comm->base.reqs;
     ncclIbAddEvent(req, ctsQp->devIndex, &comm->devs[ctsQp->devIndex].base);
@@ -2163,25 +2349,49 @@ ncclResult_t ncclIbPostFifo(struct ncclIbRecvComm* comm, int n, void** data, int
   struct ibv_send_wr* bad_wr;
   NCCLCHECK(wrap_ibv_post_send(ctsQp->qp, &wr, &bad_wr));
 
-  TRACE(NCCL_VERBS, "Posted send wr_id=%lu, wr_indx=%d, qp_num=%d, src_nic=%d, dst_nic=%d, dlid=%lu, opcode=%d, send_flags=%d, imm_data=%d, remote_addr=%lx, rkey=%x, length=%d, lkey=%x",
+#ifdef ANP_DEBUG_TRACE_EN
+  INFO(NCCL_VERBS,
+       "Posted CTS send %s, slot %d, fifoTail %lu, wr_id=%lu, wr_indx=%d, ch %d, qp_num=%d, src_nic=%d, dst_nic=%d, dlid=%u, opcode=%d, send_flags=%d, imm_data=%d, "
+       "remote_addr=%lx, rkey=%x, length=%d, lkey=%x",
+       (wr.send_flags & IBV_SEND_SIGNALED) ? "signaled" : "unsignaled", slot, comm->remFifo.fifoTail,
+       wr.wr_id, 0, ctsQp->channelId, ctsQp->qp->qp_num, comm->devs[ctsQp->devIndex].base.ibDevN, comm->base.remDevs[ctsQp->remDevIdx].ibv_dev_index,
+       comm->base.remDevs[ctsQp->remDevIdx].lid, wr.opcode, wr.send_flags, wr.imm_data, wr.wr.rdma.remote_addr, wr.wr.rdma.rkey, wr.sg_list ? wr.sg_list->length : 0,
+       wr.sg_list ? wr.sg_list->lkey : 0);
+#else
+  TRACE(NCCL_VERBS, "Posted send wr_id=%lu, wr_indx=%d, qp_num=%d, src_nic=%d, dst_nic=%d, dlid=%u, opcode=%d, send_flags=%d, imm_data=%d, remote_addr=%lx, rkey=%x, length=%d, lkey=%x",
         wr.wr_id, 0, ctsQp->qp->qp_num, comm->devs[ctsQp->devIndex].base.ibDevN, comm->base.remDevs[ctsQp->remDevIdx].ibv_dev_index, comm->base.remDevs[ctsQp->remDevIdx].lid,
         wr.opcode, wr.send_flags, wr.imm_data, wr.wr.rdma.remote_addr, wr.wr.rdma.rkey, wr.sg_list ? wr.sg_list->length : 0, wr.sg_list ? wr.sg_list->lkey : 0);
+#endif
 
-  ANP_DEBUG_EXECUTE(
+  ANP_TELEMETRY_EXECUTE(
     g_anp_state.update_cts_send_metrics(ctsQp->qp->qp_num);
+    g_debug_stats.num_cts_sent++;
+    if (signalled) {
+        g_debug_stats.num_signalled_cts_sent++;
+    }
+  );
+  ANP_TELEMETRY_EXECUTE(
+      if (signalled) {
+          g_anp_state.increment_num_cts_sent_signalled(ctsQp->qp->qp_num);
+      } else {
+          g_anp_state.increment_num_cts_sent_unsignalled(ctsQp->qp->qp_num);
+      }
   );
   comm->remFifo.fifoTail++;
 
+  // Select the next qpIndex
+  comm->base.qpIndex = (comm->base.qpIndex+1) % comm->base.nqps;
   return ncclSuccess;
 }
 
-ncclResult_t anpNetIrecv(void* recvComm, int n, void** data, int* sizes, int* tags, void** mhandles, void** request) {
+ncclResult_t anpNetIrecvDefault(void* recvComm, int n, void** data, int* sizes, int* tags, void** mhandles, void** request) {
+  ncclResult_t res = ncclSuccess;
   struct ncclIbRecvComm* comm = (struct ncclIbRecvComm*)recvComm;
   if (comm->base.ready == 0) { WARN("NET/IB: ncclIbIrecv() called when comm->base.ready == 0"); return ncclInternalError; }
   if (comm->base.ready == 0) { *request = NULL; return ncclSuccess; }
   if (n > NCCL_NET_IB_MAX_RECVS) return ncclInternalError;
 
-  struct ncclIbRequest* req;
+  struct ncclIbRequest* req = NULL;
   NCCLCHECK(ncclIbGetRequest(&comm->base, &req));
   req->type = NCCL_NET_IB_REQ_RECV;
   req->sock = &comm->base.sock;
@@ -2203,14 +2413,58 @@ ncclResult_t anpNetIrecv(void* recvComm, int n, void** data, int* sizes, int* ta
 
   // Post recvs
   struct ibv_recv_wr* bad_wr;
+  int qpIndex = comm->base.qpIndex;
   for (int i = 0; i < nqps; i++) {
     struct ncclIbQp* qp = comm->base.qps + comm->base.qpIndex;
     ncclIbAddEvent(req, qp->devIndex, &comm->devs[qp->devIndex].base);
-    NCCLCHECK(wrap_ibv_post_recv(qp->qp, &wr, &bad_wr));
-    comm->base.qpIndex = (comm->base.qpIndex+1)%comm->base.nqps;
+    if (wrap_ibv_post_recv(qp->qp, &wr, &bad_wr) != ncclSuccess)  {
+        goto err;
+    }
+#ifdef ANP_DEBUG_TRACE_EN
+    INFO(NCCL_NET, "Posted RECV WQE, ch %d, qp %d, nic %d, dev index %d",
+         qp->channelId, qp->qp->qp_num, comm->devs[qp->devIndex].base.ibDevN, qp->devIndex);
+#endif
+    ANP_TELEMETRY_EXECUTE(
+        g_debug_stats.num_recv_wqe++;
+        g_anp_state.increment_num_recv_wqe(qp->qp->qp_num);
+    );
+    // Don't update comm->base.qpIndex yet, we need to run through this same set of QPs
+    // inside ncclIbPostFifo()
+    //comm->base.qpIndex = (comm->base.qpIndex+1)%comm->base.nqps;
+    qpIndex = (qpIndex+1)%comm->base.nqps;
   }
 
   TIME_STOP(1);
+
+  // Post to FIFO to notify sender
+  TIME_START(2);
+  NCCLCHECKGOTO(ncclIbPostFifo(comm, n, data, sizes, tags, mhandles, req), res, err);
+  TIME_STOP(2);
+
+  *request = req;
+  return ncclSuccess;
+err:
+  if (req) {
+      ncclIbFreeRequest(req);
+  }
+  return res;
+}
+
+static ncclResult_t anpNetIrecvPostCTS(void* recvComm, int n, void** data, int* sizes, int* tags, void** mhandles, void** request) {
+  struct ncclIbRecvComm* comm = (struct ncclIbRecvComm*)recvComm;
+  if (comm->base.ready == 0) { WARN("NET/IB: ncclIbIrecv() called when comm->base.ready == 0"); return ncclInternalError; }
+  if (comm->base.ready == 0) { *request = NULL; return ncclSuccess; }
+  if (n > NCCL_NET_IB_MAX_RECVS) return ncclInternalError;
+
+  struct ncclIbRequest* req;
+  NCCLCHECK(ncclIbGetRequest(&comm->base, &req));
+  req->type = NCCL_NET_IB_REQ_RECV;
+  req->sock = &comm->base.sock;
+  req->nreqs = n;
+
+  for (int i = 0; i < comm->base.ndevs; i++) {
+    req->devBases[i] = &comm->devs[i].base;
+  }
 
   // Post to FIFO to notify sender
   TIME_START(2);
@@ -2219,6 +2473,19 @@ ncclResult_t anpNetIrecv(void* recvComm, int n, void** data, int* sizes, int* ta
 
   *request = req;
   return ncclSuccess;
+}
+
+ncclResult_t anpNetIrecv(void* recvComm, int n, void** data, int* sizes, int* tags, void** mhandles, void** request) {
+#ifdef ANP_DEBUG_TRACE_EN
+    INFO(NCCL_NET, "Processing recv, recvComm %p, n %d", recvComm, n);
+#endif
+    if (*request == NCCL_NET_OPTIONAL_RECV_COMPLETION) {
+        // for LL & LL128, post only CTS (no need to post RECV WQE in this case)
+        INFO(NCCL_NET, "Optional RECV completion set, posting CTS");
+        return anpNetIrecvPostCTS(recvComm, n, data, sizes, tags, mhandles, request);
+    }
+    INFO(NCCL_NET, "Optional RECV completion NOT set, posting RECV WQE & CTS");
+    return anpNetIrecvDefault(recvComm, n, data, sizes, tags, mhandles, request);
 }
 
 ncclResult_t anpNetFlush(void* recvComm, int n, void** data, int* sizes, void** mhandles, void** request) {
@@ -2275,6 +2542,7 @@ ncclResult_t anpNetFlush(void* recvComm, int n, void** data, int* sizes, void** 
   return ncclSuccess;
 }
 
+#define ANP_CQ_POLL_MAX_EVENT        16
 ncclResult_t anpNetTest(void* request, int* done, int* sizes) {
   struct ncclIbRequest *r = (struct ncclIbRequest*)request;
   *done = 0;
@@ -2294,15 +2562,16 @@ ncclResult_t anpNetTest(void* request, int* done, int* sizes) {
 
     int totalWrDone = 0;
     int wrDone = 0;
-    struct ibv_wc wcs[4];
+    struct ibv_wc wcs[ANP_CQ_POLL_MAX_EVENT];
 
     for (int i = 0; i < NCCL_IB_MAX_DEVS_PER_NIC; i++) {
       TIME_START(3);
       // If we expect any completions from this device's CQ
       if (r->events[i]) {
-        NCCLCHECK(wrap_ibv_poll_cq(r->devBases[i]->cq, 4, wcs, &wrDone));
+        NCCLCHECK(wrap_ibv_poll_cq(r->devBases[i]->cq, ANP_CQ_POLL_MAX_EVENT,
+                                   wcs, &wrDone));
         totalWrDone += wrDone;
-        ANP_DEBUG_EXECUTE(
+        ANP_TELEMETRY_EXECUTE(
             g_anp_state.update_cq_poll_metrics();
         );
         if (wrDone == 0) { TIME_CANCEL(3); } else { TIME_STOP(3); }
@@ -2338,7 +2607,8 @@ ncclResult_t anpNetTest(void* request, int* done, int* sizes) {
               ncclSocketToString(&addr, line), wc->status, wc->opcode,wc->byte_len, wc->wr_id, req, req->type, req->events[0], req->events[1], i);
           #endif
           if (req->type == NCCL_NET_IB_REQ_SEND) {
-            ANP_DEBUG_EXECUTE(
+            ANP_TELEMETRY_EXECUTE(
+                g_debug_stats.num_send_completion++;
                 g_anp_state.update_wqe_rcvd_metrics(wc->qp_num, wc->wr_id, gettime_ns());
             );
             for (int j = 0; j < req->nreqs; j++) {
@@ -2348,8 +2618,15 @@ ncclResult_t anpNetTest(void* request, int* done, int* sizes) {
                 return ncclInternalError;
               }
               sendReq->events[i]--;
+              ANP_TELEMETRY_EXECUTE(
+                  g_debug_stats.num_send_completion_ok++;
+              );
             }
           } else {
+            ANP_TELEMETRY_EXECUTE(
+                g_anp_state.update_wqe_rcvd_metrics(wc->qp_num, wc->wr_id, gettime_ns());
+                g_debug_stats.num_recv_completion++;
+            );
             if (req && wc->opcode == IBV_WC_RECV_RDMA_WITH_IMM) {
               if (req->type != NCCL_NET_IB_REQ_RECV) {
                 WARN("NET/IB: wc->opcode == IBV_WC_RECV_RDMA_WITH_IMM and req->type=%d", req->type);
@@ -2359,6 +2636,9 @@ ncclResult_t anpNetTest(void* request, int* done, int* sizes) {
                 req->recv.sizes[0] = wc->imm_data;
               }
             }
+            ANP_TELEMETRY_EXECUTE(
+                g_debug_stats.num_recv_completion_ok++;
+            );
             req->events[i]--;
           }
         }
@@ -2387,6 +2667,14 @@ ncclResult_t anpNetCloseSend(void* sendComm) {
     free(comm);
   }
   TIME_PRINT("IB");
+#if 0
+  static bool anp_stats_dumped = false;
+  if (anp_stats_dumped == false) {
+    fprintf(stderr, "Dumping ANP debug stats at the end of the run\n");
+    anp_debug_stats_dump();
+    anp_stats_dumped = true;
+  }
+#endif
   return ncclSuccess;
 }
 
