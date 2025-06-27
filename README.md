@@ -55,12 +55,18 @@ cd amd-anp
 
 ## Build Instructions
 1. **Ensure RCCL is built**: The `rccl/build` directory must contain `librccl.so`, `hipify/`, `include/`, etc.
-2. **Set `RCCL_BUILD`**:
-   - Point to `rccl/build` from your RCCL build. For example:
+2. **Set `RCCL_HOME`**:
+   - Provide the path to the RCCL source tree
+     ```bash
+      export RCCL_HOME=/home/user/rccl-src/
+      ```
+
+4. **Optional: Set `RCCL_BUILD`**:
+   - If the RCCL artifacts are not in $RCCL_HOME/build/release, then point to the build artifacts using RCCL_BUILD env var For example:
      ```bash
      export RCCL_BUILD=/home/user/rccl/build
      ```
-3. **Specify `MPI` Paths:**
+5. **Specify `MPI` Paths:**
 
    -  Please provide the include and library paths for your MPI installation.
       ```bash
@@ -69,44 +75,44 @@ cd amd-anp
       ```
       Please make sure to replace the paths with your MPI installation's paths.
 
-4. **Optional: `ROCM_PATH`**:
+6. **Optional: `ROCM_PATH`**:
    - If ROCm is in a custom directory (not `/opt/rocm`), specify:
      ```bash
-     make RCCL_BUILD=$RCCL_BUILD ROCM_PATH=/path/to/rocm
+     make RCCL_HOME=$RCCL_HOME ROCM_PATH=/path/to/rocm
      ```
 
-5. **Build Without Telemetry (Default):**
+7. **Build Without Telemetry (Default):**
 
     To build the plugin without the telemetry features enabled (the default behavior), simply run the `make` command:
 
     ```bash
-    make RCCL_BUILD=$RCCL_BUILD MPI_INCLUDE=$MPI_INCLUDE MPI_LIB_PATH=$MPI_LIB_PATH
+    make RCCL_HOME=$RCCL_HOME MPI_INCLUDE=$MPI_INCLUDE MPI_LIB_PATH=$MPI_LIB_PATH
     ```
     If successful, you will see `librccl-net.so` in the `build/` folder of this plugin project.
 
     **Example:**
     ```bash
-    make RCCL_BUILD=/home/user/rccl/build/release MPI_INCLUDE=/home/user/ompi-4.1.6/install/include/ MPI_LIB_PATH=/home/user/ompi-4.1.6/build/ompi/.libs/
+    make RCCL_HOME=/home/user/rccl-src/ MPI_INCLUDE=/home/user/ompi-4.1.6/install/include/ MPI_LIB_PATH=/home/user/ompi-4.1.6/build/ompi/.libs/
     ```
-6.  **Build With Telemetry Enabled:**
+8.  **Build With Telemetry Enabled:**
 
     To build the plugin with telemetry features enabled use the build command with flag ANP_TELEMETRY_ENABLED=1.
 
     ```bash
-    make ANP_TELEMETRY_ENABLED=1 RCCL_BUILD=$RCCL_BUILD MPI_INCLUDE=$MPI_INCLUDE MPI_LIB_PATH=$MPI_LIB_PATH
+    make ANP_TELEMETRY_ENABLED=1 RCCL_HOME=$RCCL_HOME MPI_INCLUDE=$MPI_INCLUDE MPI_LIB_PATH=$MPI_LIB_PATH
     ```
     If successful, you will see `librccl-net.so` in the `build/` folder of this plugin project.
 
     **Example:**
     ```bash
-    make ANP_TELEMETRY_ENABLED=1 RCCL_BUILD=/home/user/rccl/build/release MPI_INCLUDE=/home/user/ompi-4.1.6/install/include/ MPI_LIB_PATH=/home/user/ompi-4.1.6/build/ompi/.libs/
+    make ANP_TELEMETRY_ENABLED=1 RCCL_HOME=/home/user/rccl-src/ MPI_INCLUDE=/home/user/ompi-4.1.6/install/include/ MPI_LIB_PATH=/home/user/ompi-4.1.6/build/ompi/.libs/
 
 ---
 
 ## Install Instructions
 To install the plugin into your ROCm library path, run:
 ```bash
-sudo make RCCL_BUILD=$RCCL_BUILD ROCM_PATH=/path/to/rocm install
+sudo make RCCL_HOME=$RCCL_HOME ROCM_PATH=/path/to/rocm install
 ```
 This copies `librccl-net.so` to `<ROCM_PATH>/lib`.
 `<ROCM_PATH>` defaults to `/opt/rocm` unless overridden by `ROCM_PATH`.
@@ -139,11 +145,11 @@ make uninstall
 AMD ANP plugin provides telemetry capabilities for monitoring device status and performance. The telemetry data is captured and stored in JSON format, giving insights into communication efficiency and queue pair operations. This feature is part of the supported telemetry suite and helps in performance analysis and debugging.
 
 To enable telemetry, the plugin must be compiled with ANP_TELEMETRY_ENABLED=1.
-It then reads its configuration from a JSON file, whose location is specified by an environment variable AMD_ANP_CONFIG_FILE.
-In the absence of the environment variable AMD_ANP_CONFIG_FILE or the JSON file being unreadable, plugin uses defaults for the configuration.
+It then reads its configuration from a JSON file, whose location is specified by an environment variable RCCL_ANP_CONFIG_FILE.
+In the absence of the environment variable RCCL_ANP_CONFIG_FILE or the JSON file being unreadable, plugin uses defaults for the configuration.
 
 ```
-export AMD_ANP_CONFIG_FILE=/path/to/config.json
+export RCCL_ANP_CONFIG_FILE=/path/to/config.json
 ```
 
 ### Configuration JSON

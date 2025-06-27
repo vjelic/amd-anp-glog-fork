@@ -15,6 +15,7 @@
 // REPRESENTATIONS OF ANY KIND, EITHER EXPRESS OR IMPLIED.
 //
 
+#define NCCL_BUILD_RDMA_CORE
 #include <assert.h>
 #include <pthread.h>
 #include <stdio.h>
@@ -43,17 +44,14 @@ extern "C" {
 
 extern void *anp_rccl_bootstrap_handler(void *arg);
 
-#define NCCL_NET_OPTIONAL_RECV_COMPLETION    (void *)0x1
 #define NCCL_NET_USE_WRITE_OP                (void *)0x1
 #define ANP_CTS_QP_SLOT_INVALID              0xFF
 
 //#define ANP_DEBUG_TRACE_EN
-#define CTS_RCVR_OFFLOAD_ENABLED
 #define CTS_INLINE_ENABLED
 
 #define MAX_INLINE_DATA_SIZE 24
 #define ENABLE_TIMER 0
-#define NCCL_NET_PLUGIN_SYMBOL ncclNetPlugin_v8
 
 #define MAXNAMESIZE 64
 static char ncclIbIfName[MAX_IF_NAME_SIZE+1];
@@ -66,7 +64,6 @@ anp_log_level_e anp_logger::log_level = LOG_ERROR;
 std::atomic<int> active_threads(0);
 
 static char libPathInfo[2048];
-thread_local int ncclDebugNoWarn = 1;
 
 struct {
   uint64_t num_cts_sent;
@@ -975,6 +972,7 @@ ncclResult_t anpNetGetProperties(int dev, ncclNetProperties_t* props) {
   props->maxRecvs = NCCL_NET_IB_MAX_RECVS;
   props->netDeviceType    = NCCL_NET_DEVICE_HOST;
   props->netDeviceVersion = NCCL_NET_DEVICE_INVALID_VERSION;
+  props->maxP2pBytes = NCCL_MAX_NET_SIZE_BYTES;
   return ncclSuccess;
 }
 
@@ -1305,6 +1303,11 @@ ncclResult_t ncclIbCreateQp(uint8_t ib_port, struct ncclIbNetCommDevBase* base,
     qpInitAttr.sq_sig_all &= (~(1 << 17));
   }
   qpInitAttr.sq_sig_all |= (1 << 18);
+#if !defined(CTS_RCVR_OFFLOAD_ENABLED)
+  qpInitAttr.sq_sig_all &= (~(1 << 19));
+#else
+  qpInitAttr.sq_sig_all |= (1 << 19);
+#endif
   // We might send 2 messages per send (RDMA and RDMA_WITH_IMM)
   qpInitAttr.cap.max_send_wr = 2*MAX_REQUESTS;
   qpInitAttr.cap.max_recv_wr = MAX_REQUESTS;
@@ -2160,7 +2163,7 @@ ncclResult_t ncclIbMultiSend(struct ncclIbSendComm* comm, int slot, bool use_wri
   return ncclSuccess;
 }
 
-ncclResult_t anpNetIsend(void* sendComm, void* data, int size, int tag, void* mhandle, void** request) {
+ncclResult_t anpNetIsend(void* sendComm, void* data, size_t size, int tag, void* mhandle, void** request) {
   struct ncclIbSendComm* comm = (struct ncclIbSendComm*)sendComm;
   if (comm->base.ready == 0) { WARN("NET/IB: ncclIbIsend() called when comm->base.ready == 0"); return ncclInternalError; }
   if (comm->base.ready == 0) { *request = NULL; return ncclSuccess; }
@@ -2267,7 +2270,7 @@ ncclResult_t anpNetIsend(void* sendComm, void* data, int size, int tag, void* mh
   return ncclSuccess;
 }
 
-ncclResult_t ncclIbPostFifo(struct ncclIbRecvComm* comm, int n, void** data, int* sizes, int* tags, void** mhandles, struct ncclIbRequest* req) {
+ncclResult_t ncclIbPostFifo(struct ncclIbRecvComm* comm, int n, void** data, size_t* sizes, int* tags, void** mhandles, struct ncclIbRequest* req) {
   bool signalled = false;
   struct ibv_send_wr wr;
   memset(&wr, 0, sizeof(wr));
@@ -2384,7 +2387,7 @@ ncclResult_t ncclIbPostFifo(struct ncclIbRecvComm* comm, int n, void** data, int
   return ncclSuccess;
 }
 
-ncclResult_t anpNetIrecvDefault(void* recvComm, int n, void** data, int* sizes, int* tags, void** mhandles, void** request) {
+ncclResult_t anpNetIrecvDefault(void* recvComm, int n, void** data, size_t* sizes, int* tags, void** mhandles, void** request) {
   ncclResult_t res = ncclSuccess;
   struct ncclIbRecvComm* comm = (struct ncclIbRecvComm*)recvComm;
   if (comm->base.ready == 0) { WARN("NET/IB: ncclIbIrecv() called when comm->base.ready == 0"); return ncclInternalError; }
@@ -2450,7 +2453,7 @@ err:
   return res;
 }
 
-static ncclResult_t anpNetIrecvPostCTS(void* recvComm, int n, void** data, int* sizes, int* tags, void** mhandles, void** request) {
+static ncclResult_t anpNetIrecvPostCTS(void* recvComm, int n, void** data, size_t* sizes, int* tags, void** mhandles, void** request) {
   struct ncclIbRecvComm* comm = (struct ncclIbRecvComm*)recvComm;
   if (comm->base.ready == 0) { WARN("NET/IB: ncclIbIrecv() called when comm->base.ready == 0"); return ncclInternalError; }
   if (comm->base.ready == 0) { *request = NULL; return ncclSuccess; }
@@ -2475,11 +2478,11 @@ static ncclResult_t anpNetIrecvPostCTS(void* recvComm, int n, void** data, int* 
   return ncclSuccess;
 }
 
-ncclResult_t anpNetIrecv(void* recvComm, int n, void** data, int* sizes, int* tags, void** mhandles, void** request) {
+ncclResult_t anpNetIrecv(void* recvComm, int n, void** data, size_t* sizes, int* tags, void** mhandles, void** request) {
 #ifdef ANP_DEBUG_TRACE_EN
     INFO(NCCL_NET, "Processing recv, recvComm %p, n %d", recvComm, n);
 #endif
-    if (*request == NCCL_NET_OPTIONAL_RECV_COMPLETION) {
+    if (*request == (void *)NCCL_NET_OPTIONAL_RECV_COMPLETION) {
         // for LL & LL128, post only CTS (no need to post RECV WQE in this case)
         INFO(NCCL_NET, "Optional RECV completion set, posting CTS");
         return anpNetIrecvPostCTS(recvComm, n, data, sizes, tags, mhandles, request);
@@ -2738,4 +2741,4 @@ ncclNet_t NCCL_NET_PLUGIN_SYMBOL = {
     .closeListen = anpNetCloseListen,
 };
 
-//typedef ncclCollNet_v8_t ncclCollNet_t;
+#undef NCCL_BUILD_RDMA_CORE

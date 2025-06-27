@@ -479,7 +479,7 @@ public:
         bucket_sz_log2 = (uint32_t) log2(1024);
         max_buckets = 5;
 
-        const char* config_file_env = std::getenv("AMD_ANP_CONFIG_FILE");
+        const char* config_file_env = std::getenv("RCCL_ANP_CONFIG_FILE");
 
         if (config_file_env != NULL) {
             anp_config_file_path = std::string(config_file_env);
