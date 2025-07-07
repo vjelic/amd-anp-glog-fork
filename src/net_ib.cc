@@ -49,6 +49,7 @@ extern void *anp_rccl_bootstrap_handler(void *arg);
 
 //#define ANP_DEBUG_TRACE_EN
 #define CTS_INLINE_ENABLED
+#define CTS_RCVR_OFFLOAD_ENABLED
 
 #define MAX_INLINE_DATA_SIZE 24
 #define ENABLE_TIMER 0
