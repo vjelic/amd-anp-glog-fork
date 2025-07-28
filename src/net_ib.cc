@@ -141,6 +141,7 @@ NCCL_PARAM(IbArThreshold, "IB_AR_THRESHOLD", 8192);
 NCCL_PARAM(IbPciRelaxedOrdering, "IB_PCI_RELAXED_ORDERING", 2);
 NCCL_PARAM(IbAdaptiveRouting, "IB_ADAPTIVE_ROUTING", -2);
 NCCL_PARAM(IbFifoTc, "IB_FIFO_TC", 0);
+NCCL_PARAM(DmaBufEnable, "DMABUF_ENABLE", 0);
 
 pthread_t ncclIbAsyncThread;
 struct allocationTracker allocTracker[MAX_ALLOC_TRACK_NGPU] = {};
@@ -943,8 +944,11 @@ ncclResult_t ncclIbGdrSupport() {
 // ncclSuccess : DMA-BUF support is available
 // ncclSystemError : DMA-BUF is not supported by the kernel
 ncclResult_t ncclIbDmaBufSupport(int dev) {
-    // DMA-BUF support is turned off by default for now.
-    return ncclSystemError;
+  if (ncclParamDmaBufEnable() == 1) {
+    WARN("DMABUF Enabled");
+    return ncclSuccess;
+  }
+  return ncclSystemError;
 }
 
 #define NCCL_NET_IB_MAX_RECVS 8
@@ -2732,6 +2736,7 @@ ncclNet_t NCCL_NET_PLUGIN_SYMBOL = {
     .connect = anpNetConnect,
     .accept = anpNetAccept,
     .regMr = anpNetRegMr,
+    .regMrDmaBuf = ncclIbRegMrDmaBuf,
     .deregMr = anpNetDeregMr,
     .isend = anpNetIsend,
     .irecv = anpNetIrecv,
